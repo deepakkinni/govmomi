@@ -456,36 +456,16 @@ func CnsUnregisterVolumeEx(ctx context.Context, r soap.RoundTripper, req *types.
 	return resBody.Res, nil
 }
 
-type CnsAcknowledgeUnregisterBody struct {
-	Req    *types.CnsAcknowledgeUnregister         `xml:"urn:vsan CnsAcknowledgeUnregister,omitempty"`
-	Res    *types.CnsAcknowledgeUnregisterResponse `xml:"urn:vsan CnsAcknowledgeUnregisterResponse,omitempty"`
-	Fault_ *soap.Fault                             `xml:"http://schemas.xmlsoap.org/soap/envelope/ Fault,omitempty"`
+type CnsQueryUnregisterFeasibilityBody struct {
+	Req    *types.CnsQueryUnregisterFeasibility         `xml:"urn:vsan CnsQueryUnregisterFeasibility,omitempty"`
+	Res    *types.CnsQueryUnregisterFeasibilityResponse `xml:"urn:vsan CnsQueryUnregisterFeasibilityResponse,omitempty"`
+	Fault_ *soap.Fault                                  `xml:"http://schemas.xmlsoap.org/soap/envelope/ Fault,omitempty"`
 }
 
-func (b *CnsAcknowledgeUnregisterBody) Fault() *soap.Fault { return b.Fault_ }
+func (b *CnsQueryUnregisterFeasibilityBody) Fault() *soap.Fault { return b.Fault_ }
 
-func CnsAcknowledgeUnregister(ctx context.Context, r soap.RoundTripper, req *types.CnsAcknowledgeUnregister) (*types.CnsAcknowledgeUnregisterResponse, error) {
-	var reqBody, resBody CnsAcknowledgeUnregisterBody
-
-	reqBody.Req = req
-
-	if err := r.RoundTrip(ctx, &reqBody, &resBody); err != nil {
-		return nil, err
-	}
-
-	return resBody.Res, nil
-}
-
-type CnsQueryPendingUnregistersBody struct {
-	Req    *types.CnsQueryPendingUnregisters         `xml:"urn:vsan CnsQueryPendingUnregisters,omitempty"`
-	Res    *types.CnsQueryPendingUnregistersResponse `xml:"urn:vsan CnsQueryPendingUnregistersResponse,omitempty"`
-	Fault_ *soap.Fault                               `xml:"http://schemas.xmlsoap.org/soap/envelope/ Fault,omitempty"`
-}
-
-func (b *CnsQueryPendingUnregistersBody) Fault() *soap.Fault { return b.Fault_ }
-
-func CnsQueryPendingUnregisters(ctx context.Context, r soap.RoundTripper, req *types.CnsQueryPendingUnregisters) (*types.CnsQueryPendingUnregistersResponse, error) {
-	var reqBody, resBody CnsQueryPendingUnregistersBody
+func CnsQueryUnregisterFeasibility(ctx context.Context, r soap.RoundTripper, req *types.CnsQueryUnregisterFeasibility) (*types.CnsQueryUnregisterFeasibilityResponse, error) {
+	var reqBody, resBody CnsQueryUnregisterFeasibilityBody
 
 	reqBody.Req = req
 

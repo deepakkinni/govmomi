@@ -14,6 +14,7 @@ import (
 	"github.com/vmware/govmomi/cns"
 	cnstypes "github.com/vmware/govmomi/cns/types"
 	"github.com/vmware/govmomi/simulator"
+	"github.com/vmware/govmomi/task"
 	vim25types "github.com/vmware/govmomi/vim25/types"
 	"github.com/vmware/govmomi/vslm"
 )
@@ -83,7 +84,7 @@ func TestUnregisterVolumeEx(t *testing.T) {
 	}
 	volumeId := createTaskResult.GetCnsVolumeOperationResult().VolumeId
 
-	// Phase 1: UnregisterVolumeEx -- removes volume and writes PENDING_UNREGISTER
+	// UnregisterVolumeEx -- removes the volume from CNS inventory in one call.
 	unregExTask, err := cnsClient.UnregisterVolumeEx(ctx, []cnstypes.CnsUnregisterVolumeSpec{
 		{
 			VolumeId:         volumeId,
@@ -122,37 +123,277 @@ func TestUnregisterVolumeEx(t *testing.T) {
 		t.Fatalf("expected 0 volumes after UnregisterVolumeEx, got %d", len(queryResult.Volumes))
 	}
 
-	// QueryPendingUnregisters -- should show our volume
-	pending, err := cnsClient.QueryPendingUnregisters(ctx)
+	// Re-issuing UnregisterVolumeEx on the same (now-gone) volume must report
+	// NotFound rather than success a second time; callers treat that as success.
+	reUnregTask, err := cnsClient.UnregisterVolumeEx(ctx, []cnstypes.CnsUnregisterVolumeSpec{
+		{
+			VolumeId:         volumeId,
+			TargetVolumeType: string(cnstypes.CnsUnregisterTargetVolumeTypeLEGACY_DISK),
+		},
+	})
 	if err != nil {
-		t.Fatalf("QueryPendingUnregisters failed: %v", err)
+		t.Fatalf("second UnregisterVolumeEx failed: %v", err)
 	}
-	if len(pending) != 1 {
-		t.Fatalf("expected 1 pending unregister, got %d", len(pending))
+	if _, err := cns.GetTaskInfo(ctx, reUnregTask); err == nil {
+		t.Fatal("expected second UnregisterVolumeEx to fault with NotFound, task succeeded")
+	} else if fault := taskFault(t, err); fault == nil {
+		t.Fatalf("expected a task fault, got plain error: %v", err)
+	} else if _, ok := fault.(*vim25types.NotFound); !ok {
+		t.Fatalf("expected NotFound fault on second UnregisterVolumeEx, got %T", fault)
 	}
-	if pending[0].VolumeId.Id != volumeId.Id {
-		t.Fatalf("pending unregister volumeId mismatch: got %q, want %q", pending[0].VolumeId.Id, volumeId.Id)
-	}
-	t.Logf("QueryPendingUnregisters: found pending record for volume %q", pending[0].VolumeId.Id)
+}
 
-	// Phase 2: AcknowledgeUnregister -- clears PENDING_UNREGISTER record
-	if err := cnsClient.AcknowledgeUnregister(ctx, []cnstypes.CnsVolumeId{volumeId}); err != nil {
-		t.Fatalf("AcknowledgeUnregister failed: %v", err)
+// taskFault extracts the BaseMethodFault from a task-level error returned by
+// cns.GetTaskInfo, or nil if err is not a task.Error.
+func taskFault(t *testing.T, err error) vim25types.BaseMethodFault {
+	t.Helper()
+	terr, ok := err.(task.Error)
+	if !ok {
+		return nil
+	}
+	return terr.Fault()
+}
+
+// TestQueryUnregisterFeasibility exercises the side-effect-free unregister
+// precondition check: an all-feasible batch, injected blockers of each
+// disposition, a mixed known/unknown volume batch, and the argument-length
+// validation boundaries.
+func TestQueryUnregisterFeasibility(t *testing.T) {
+	ctx := context.Background()
+
+	model := simulator.VPX()
+	defer model.Remove()
+
+	if err := model.Create(); err != nil {
+		t.Fatal(err)
 	}
 
-	// QueryPendingUnregisters again -- should be empty
-	pending, err = cnsClient.QueryPendingUnregisters(ctx)
+	s := model.Service.NewServer()
+	defer s.Close()
+
+	registry := New()
+	model.Service.RegisterSDK(registry)
+
+	c, err := govmomi.NewClient(ctx, s.URL, true)
 	if err != nil {
-		t.Fatalf("QueryPendingUnregisters after ack failed: %v", err)
-	}
-	if len(pending) != 0 {
-		t.Fatalf("expected 0 pending unregisters after ack, got %d", len(pending))
+		t.Fatal(err)
 	}
 
-	// AcknowledgeUnregister again -- idempotent, must not error
-	if err := cnsClient.AcknowledgeUnregister(ctx, []cnstypes.CnsVolumeId{volumeId}); err != nil {
-		t.Fatalf("second AcknowledgeUnregister (idempotent) failed: %v", err)
+	cnsClient, err := cns.NewClient(ctx, c.Client)
+	if err != nil {
+		t.Fatal(err)
 	}
+
+	volumeManager := registry.Get(cns.CnsVolumeManagerInstance).(*CnsVolumeManager)
+
+	datastore := model.Map().Any("Datastore").(*simulator.Datastore)
+	var capacityInMb int64 = 1024
+
+	createVolume := func(name string) cnstypes.CnsVolumeId {
+		createTask, err := cnsClient.CreateVolume(ctx, []cnstypes.CnsVolumeCreateSpec{
+			{
+				Name:       name,
+				VolumeType: "TestVolumeType",
+				Datastores: []vim25types.ManagedObjectReference{datastore.Self},
+				BackingObjectDetails: &cnstypes.CnsBlockBackingDetails{
+					CnsBackingObjectDetails: cnstypes.CnsBackingObjectDetails{
+						CapacityInMb: capacityInMb,
+					},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		taskInfo, err := cns.GetTaskInfo(ctx, createTask)
+		if err != nil {
+			t.Fatal(err)
+		}
+		taskResult, err := cns.GetTaskResult(ctx, taskInfo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		opRes := taskResult.GetCnsVolumeOperationResult()
+		if opRes.Fault != nil {
+			t.Fatalf("create volume %q fault: %+v", name, opRes.Fault)
+		}
+		return opRes.VolumeId
+	}
+
+	queryFeasibility := func(volumeIds []cnstypes.CnsVolumeId) []cnstypes.CnsUnregisterFeasibilityResult {
+		queryTask, err := cnsClient.QueryUnregisterFeasibility(
+			ctx, volumeIds, string(cnstypes.CnsUnregisterTargetVolumeTypeLEGACY_DISK))
+		if err != nil {
+			t.Fatal(err)
+		}
+		taskInfo, err := cns.GetTaskInfo(ctx, queryTask)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resultArray, err := cns.GetTaskResultArray(ctx, taskInfo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		results := make([]cnstypes.CnsUnregisterFeasibilityResult, 0, len(resultArray))
+		for _, r := range resultArray {
+			results = append(results, *r.(*cnstypes.CnsUnregisterFeasibilityResult))
+		}
+		return results
+	}
+
+	t.Run("all feasible", func(t *testing.T) {
+		v1 := createVolume("feasibility-a")
+		v2 := createVolume("feasibility-b")
+
+		results := queryFeasibility([]cnstypes.CnsVolumeId{v1, v2})
+		if len(results) != 2 {
+			t.Fatalf("expected 2 results, got %d", len(results))
+		}
+		for i, want := range []cnstypes.CnsVolumeId{v1, v2} {
+			if results[i].VolumeId.Id != want.Id {
+				t.Fatalf("result[%d] volumeId mismatch: got %q, want %q", i, results[i].VolumeId.Id, want.Id)
+			}
+			if !results[i].Feasible {
+				t.Fatalf("result[%d] volume=%s: expected feasible, blockers=%+v", i, want.Id, results[i].Blockers)
+			}
+			if len(results[i].Blockers) != 0 {
+				t.Fatalf("result[%d] volume=%s: expected no blockers, got %+v", i, want.Id, results[i].Blockers)
+			}
+		}
+	})
+
+	t.Run("injected blockers by disposition", func(t *testing.T) {
+		permanent := createVolume("feasibility-permanent")
+		structural := createVolume("feasibility-structural")
+		transient := createVolume("feasibility-transient")
+
+		volumeManager.SetUnregisterBlockers(permanent, []cnstypes.CnsUnregisterBlocker{
+			{
+				Condition:   cnstypes.CnsUnregisterBlockerConditionLinkedClone,
+				Disposition: cnstypes.CnsUnregisterBlockerDispositionPermanent,
+				Detail:      "volume is a linked clone",
+			},
+		})
+		volumeManager.SetUnregisterBlockers(structural, []cnstypes.CnsUnregisterBlocker{
+			{
+				Condition:   cnstypes.CnsUnregisterBlockerConditionFcdSnapshotsPresent,
+				Disposition: cnstypes.CnsUnregisterBlockerDispositionStructural,
+				Detail:      "1 FCD snapshot present",
+			},
+		})
+		volumeManager.SetUnregisterBlockers(transient, []cnstypes.CnsUnregisterBlocker{
+			{
+				Condition:   cnstypes.CnsUnregisterBlockerConditionHostUnreachable,
+				Disposition: cnstypes.CnsUnregisterBlockerDispositionTransient,
+			},
+		})
+		t.Cleanup(func() {
+			volumeManager.SetUnregisterBlockers(permanent, nil)
+			volumeManager.SetUnregisterBlockers(structural, nil)
+			volumeManager.SetUnregisterBlockers(transient, nil)
+		})
+
+		results := queryFeasibility([]cnstypes.CnsVolumeId{permanent, structural, transient})
+		if len(results) != 3 {
+			t.Fatalf("expected 3 results, got %d", len(results))
+		}
+
+		wantCondition := []string{
+			cnstypes.CnsUnregisterBlockerConditionLinkedClone,
+			cnstypes.CnsUnregisterBlockerConditionFcdSnapshotsPresent,
+			cnstypes.CnsUnregisterBlockerConditionHostUnreachable,
+		}
+		wantDisposition := []string{
+			cnstypes.CnsUnregisterBlockerDispositionPermanent,
+			cnstypes.CnsUnregisterBlockerDispositionStructural,
+			cnstypes.CnsUnregisterBlockerDispositionTransient,
+		}
+		for i, r := range results {
+			if r.Feasible {
+				t.Fatalf("result[%d]: expected infeasible", i)
+			}
+			if len(r.Blockers) != 1 {
+				t.Fatalf("result[%d]: expected exactly 1 blocker, got %d", i, len(r.Blockers))
+			}
+			if r.Blockers[0].Condition != wantCondition[i] {
+				t.Errorf("result[%d] condition: got %q, want %q", i, r.Blockers[0].Condition, wantCondition[i])
+			}
+			if r.Blockers[0].Disposition != wantDisposition[i] {
+				t.Errorf("result[%d] disposition: got %q, want %q", i, r.Blockers[0].Disposition, wantDisposition[i])
+			}
+		}
+	})
+
+	t.Run("unknown volume reports a fault, known volumes still resolve", func(t *testing.T) {
+		known := createVolume("feasibility-known")
+		unknown := cnstypes.CnsVolumeId{Id: uuid.New().String()}
+
+		results := queryFeasibility([]cnstypes.CnsVolumeId{known, unknown})
+		if len(results) != 2 {
+			t.Fatalf("expected 2 results, got %d", len(results))
+		}
+		if results[0].Fault != nil {
+			t.Fatalf("known volume: unexpected fault %+v", results[0].Fault)
+		}
+		if !results[0].Feasible {
+			t.Fatalf("known volume: expected feasible")
+		}
+		if results[1].Fault == nil {
+			t.Fatal("unknown volume: expected a fault, got none")
+		}
+		if _, ok := results[1].Fault.Fault.(*vim25types.NotFound); !ok {
+			t.Fatalf("unknown volume: expected NotFound fault, got %T", results[1].Fault.Fault)
+		}
+	})
+
+	t.Run("empty volumeIds is rejected", func(t *testing.T) {
+		queryTask, err := cnsClient.QueryUnregisterFeasibility(
+			ctx, nil, string(cnstypes.CnsUnregisterTargetVolumeTypeLEGACY_DISK))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, taskErr := cns.GetTaskInfo(ctx, queryTask)
+		if taskErr == nil {
+			t.Fatal("expected a task fault for empty volumeIds, task succeeded")
+		}
+		if fault := taskFault(t, taskErr); fault == nil {
+			t.Fatalf("expected a task fault, got plain error: %v", taskErr)
+		} else if _, ok := fault.(*vim25types.InvalidArgument); !ok {
+			t.Fatalf("expected InvalidArgument fault, got %T", fault)
+		}
+	})
+
+	t.Run("batch size boundary", func(t *testing.T) {
+		atLimit := make([]cnstypes.CnsVolumeId, cnstypes.QueryUnregisterFeasibilityBatchLimit)
+		for i := range atLimit {
+			atLimit[i] = cnstypes.CnsVolumeId{Id: uuid.New().String()}
+		}
+		queryTask, err := cnsClient.QueryUnregisterFeasibility(
+			ctx, atLimit, string(cnstypes.CnsUnregisterTargetVolumeTypeLEGACY_DISK))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, taskErr := cns.GetTaskInfo(ctx, queryTask); taskErr != nil {
+			t.Fatalf("expected batch of %d to be accepted, got fault: %v",
+				cnstypes.QueryUnregisterFeasibilityBatchLimit, taskErr)
+		}
+
+		overLimit := append(atLimit, cnstypes.CnsVolumeId{Id: uuid.New().String()})
+		queryTask, err = cnsClient.QueryUnregisterFeasibility(
+			ctx, overLimit, string(cnstypes.CnsUnregisterTargetVolumeTypeLEGACY_DISK))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, taskErr := cns.GetTaskInfo(ctx, queryTask)
+		if taskErr == nil {
+			t.Fatal("expected a task fault for over-limit batch, task succeeded")
+		}
+		if fault := taskFault(t, taskErr); fault == nil {
+			t.Fatalf("expected a task fault, got plain error: %v", taskErr)
+		} else if _, ok := fault.(*vim25types.InvalidArgument); !ok {
+			t.Fatalf("expected InvalidArgument fault, got %T", fault)
+		}
+	})
 }
 
 func TestSimulator(t *testing.T) {

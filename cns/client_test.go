@@ -20,6 +20,7 @@ import (
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/pbm"
 	"github.com/vmware/govmomi/property"
+	"github.com/vmware/govmomi/task"
 	"github.com/vmware/govmomi/vim25/debug"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/soap"
@@ -2000,21 +2001,19 @@ func TestUnregisterVolume(t *testing.T) {
 	t.Logf("Volume unregistered successfully: %s", volumeId)
 }
 
-// TestUnregisterVolumeExFlow exercises the two-phase unregister protocol:
+// TestUnregisterVolumeExFlow exercises the single-phase in-place unregister:
 //  1. Create 10 block volumes.
-//  2. UnregisterVolumeEx (phase 1) — called once per volume; the CNS server
-//     only processes unregisterSpec[0] so each call carries exactly one spec.
+//  2. UnregisterVolumeEx — called once per volume; the CNS server only
+//     processes unregisterSpec[0] so each call carries exactly one spec.
 //     For each volume BackingDiskPath and DiskUUID are logged. DiskUUID is also
 //     cross-checked against VirtualDiskManager.QueryVirtualDiskUuid; the two
 //     should match once the product bug is fixed (currently DiskUUID is sourced
-//     from backingObjectId which is empty on VMFS).
-//  3. QueryPendingUnregisters — verify all 10 volumes appear as pending.
-//  4. AcknowledgeUnregister (phase 2) — single batch call for all 10.
-//  5. QueryPendingUnregisters again — verify none of our 10 remain.
-//  6. AcknowledgeUnregister again — verify idempotency.
-//  7. Re-register each volume as a static CNS volume using the original FCD ID
+//     from backingObjectId which is empty on VMFS). Re-issuing the call on one
+//     of the now-unregistered volumes is also checked: it must report NotFound
+//     rather than success a second time.
+//  3. Re-register each volume as a static CNS volume using the original FCD ID
 //     (BackingDiskId) and disk path (BackingDiskPath) returned in step 2.
-//  8. Delete each re-registered volume.
+//  4. Delete each re-registered volume.
 //     Cleanup (via t.Cleanup) handles best-effort deletion if the test fails early.
 //
 // Note: DiskUUID in CnsUnregisterVolumeResult is currently populated from the
@@ -2082,7 +2081,7 @@ func TestUnregisterVolumeExFlow(t *testing.T) {
 	// volumeNames stores the PVC name per volume so re-registration can reuse it.
 	volumeNames := make([]string, numVolumes)
 
-	// reregisteredIds accumulates the volume IDs returned by Step 7
+	// reregisteredIds accumulates the volume IDs returned by Step 3
 	// (re-registration). Declared here so the cleanup closure can reference it
 	// even though it is populated later in the test body.
 	var reregisteredIds []cnstypes.CnsVolumeId
@@ -2119,7 +2118,7 @@ func TestUnregisterVolumeExFlow(t *testing.T) {
 
 	// Best-effort cleanup: delete any volumes that still exist (e.g. if the
 	// test fails mid-way). Covers both the original volumeIds and any
-	// reregisteredIds accumulated in Step 7.
+	// reregisteredIds accumulated in Step 3.
 	t.Cleanup(func() {
 		cctx := context.Background()
 		// Collect all IDs to clean; de-duplicate in case FCD_TRANSACTION_SUPPORT
@@ -2174,11 +2173,11 @@ func TestUnregisterVolumeExFlow(t *testing.T) {
 		t.Logf("Created volume[%d]: %s name=%s", i, opRes.VolumeId.Id, volName)
 	}
 
-	// Step 2: UnregisterVolumeEx (phase 1) — one call per volume.
+	// Step 2: UnregisterVolumeEx — one call per volume.
 	// The CNS server implementation only processes unregisterSpec[0], so each
 	// invocation carries exactly one spec.
 	// The BackingDiskPath and DiskUUID from each result are saved for use in
-	// step 4 (re-registration) and for cross-checking with VirtualDiskManager.
+	// step 3 (re-registration) and for cross-checking with VirtualDiskManager.
 	vdm := object.NewVirtualDiskManager(cnsClient.vim25Client)
 	for i, vid := range volumeIds {
 		unregSpec := []cnstypes.CnsUnregisterVolumeSpec{
@@ -2234,52 +2233,36 @@ func TestUnregisterVolumeExFlow(t *testing.T) {
 		}
 	}
 
-	// Step 3: QueryPendingUnregisters — all 10 volumes must appear.
-	pending, err := cnsClient.QueryPendingUnregisters(ctx)
-	if err != nil {
-		t.Fatalf("QueryPendingUnregisters failed: %v", err)
-	}
-	pendingByID := make(map[string]bool, len(pending))
-	for _, p := range pending {
-		pendingByID[p.VolumeId.Id] = true
-	}
-	for _, vid := range volumeIds {
-		if !pendingByID[vid.Id] {
-			t.Errorf("QueryPendingUnregisters: volume %s not found in pending list", vid.Id)
+	// Re-issuing UnregisterVolumeEx on an already-unregistered volume reports
+	// NotFound rather than success a second time; callers must treat that as
+	// success. Exercised once, against volumeIds[0], since the behavior is
+	// per-volume and does not need repeating for all 10.
+	{
+		vid := volumeIds[0]
+		reUnregTask, err := cnsClient.UnregisterVolumeEx(ctx, []cnstypes.CnsUnregisterVolumeSpec{
+			{
+				VolumeId:         vid,
+				TargetVolumeType: string(cnstypes.CnsUnregisterTargetVolumeTypeFCD),
+			},
+		})
+		if err != nil {
+			t.Fatalf("second UnregisterVolumeEx volume=%s failed: %v", vid.Id, err)
 		}
-	}
-	t.Logf("QueryPendingUnregisters: found %d pending record(s) (our volumes=%d)", len(pending), numVolumes)
-
-	// Step 4: AcknowledgeUnregister (phase 2) — single batch call for all 10.
-	if err := cnsClient.AcknowledgeUnregister(ctx, volumeIds); err != nil {
-		t.Fatalf("AcknowledgeUnregister failed: %v", err)
-	}
-	t.Logf("AcknowledgeUnregister succeeded for %d volume(s)", numVolumes)
-
-	// Step 5: QueryPendingUnregisters — none of our 10 volumes may remain pending.
-	pending, err = cnsClient.QueryPendingUnregisters(ctx)
-	if err != nil {
-		t.Fatalf("QueryPendingUnregisters after ack failed: %v", err)
-	}
-	stillPendingByID := make(map[string]bool, len(pending))
-	for _, p := range pending {
-		stillPendingByID[p.VolumeId.Id] = true
-	}
-	for _, vid := range volumeIds {
-		if stillPendingByID[vid.Id] {
-			t.Errorf("volume %s still pending after AcknowledgeUnregister", vid.Id)
+		_, taskErr := GetTaskInfo(ctx, reUnregTask)
+		if taskErr == nil {
+			t.Fatalf("expected second UnregisterVolumeEx volume=%s to fault with NotFound, task succeeded", vid.Id)
 		}
+		terr, ok := taskErr.(task.Error)
+		if !ok {
+			t.Fatalf("expected task.Error, got %T: %v", taskErr, taskErr)
+		}
+		if _, ok := terr.Fault().(*vim25types.NotFound); !ok {
+			t.Fatalf("expected NotFound fault on second UnregisterVolumeEx volume=%s, got %T", vid.Id, terr.Fault())
+		}
+		t.Logf("second UnregisterVolumeEx volume=%s: NotFound as expected", vid.Id)
 	}
-	t.Logf("QueryPendingUnregisters after ack: none of our %d volumes remain pending (total pending=%d)",
-		numVolumes, len(pending))
 
-	// Step 6: AcknowledgeUnregister again — must be idempotent.
-	if err := cnsClient.AcknowledgeUnregister(ctx, volumeIds); err != nil {
-		t.Fatalf("AcknowledgeUnregister (idempotency check) failed: %v", err)
-	}
-	t.Logf("AcknowledgeUnregister idempotency check passed")
-
-	// Step 7: Re-register each volume as a static CNS volume using the VMDK URL
+	// Step 3: Re-register each volume as a static CNS volume using the VMDK URL
 	// path (BackingDiskUrlPath) returned by UnregisterVolumeEx in step 2.
 	//
 	// After UnregisterVolumeEx the FCD entry is gone from the catalog, so we
@@ -2353,7 +2336,7 @@ func TestUnregisterVolumeExFlow(t *testing.T) {
 		reregisteredIds = append(reregisteredIds, reregOpRes.VolumeId)
 	}
 
-	// Step 7b: Wait for all re-registered volumes to become visible as CNS
+	// Step 3b: Wait for all re-registered volumes to become visible as CNS
 	// volumes via QueryVolume before attempting deletion.
 	//
 	// After CreateVolume returns the FCD is registered and the volume is in the
@@ -2404,7 +2387,7 @@ func TestUnregisterVolumeExFlow(t *testing.T) {
 		}
 	}
 
-	// Step 8: Delete each re-registered volume (using the ID returned by
+	// Step 4: Delete each re-registered volume (using the ID returned by
 	// CreateVolume, which should match the original when FCD_TRANSACTION_SUPPORT
 	// is active). NotFound is treated as success: if the volume is already gone
 	// (e.g. a prior partial run already cleaned it up) that is the desired state.
@@ -2433,6 +2416,190 @@ func TestUnregisterVolumeExFlow(t *testing.T) {
 			t.Fatalf("DeleteVolume[%d] volume=%s fault: %+v", i, vid.Id, deleteOpRes.Fault)
 		}
 		t.Logf("Deleted re-registered volume[%d]: %s", i, vid.Id)
+	}
+}
+
+// TestQueryUnregisterFeasibilityFlow exercises CnsQueryUnregisterFeasibility
+// against a live vCenter: a plain volume must report feasible, and a volume
+// carrying an FCD snapshot must report infeasible with the FcdSnapshotsPresent
+// condition. Requires vSphere 9.2.0 or later.
+func TestQueryUnregisterFeasibilityFlow(t *testing.T) {
+	ctx := context.Background()
+
+	url := os.Getenv("CNS_VC_URL")
+	datacenter := os.Getenv("CNS_DATACENTER")
+	datastore := os.Getenv("CNS_DATASTORE")
+	if url == "" || datacenter == "" || datastore == "" {
+		t.Skip("CNS_VC_URL, CNS_DATACENTER, and CNS_DATASTORE must be set")
+	}
+
+	u, err := soap.ParseURL(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := govmomi.NewClient(ctx, u, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !isvSphereVersion92orAbove(ctx, c.ServiceContent.About) {
+		t.Skip("TestQueryUnregisterFeasibilityFlow requires vSphere 9.2.0 or above")
+	}
+
+	cnsClient, err := NewClient(ctx, c.Client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	finder := find.NewFinder(cnsClient.vim25Client, false)
+	dc, err := finder.Datacenter(ctx, datacenter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finder.SetDatacenter(dc)
+	ds, err := finder.Datastore(ctx, datastore)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	containerCluster := cnstypes.CnsContainerCluster{
+		ClusterType:         string(cnstypes.CnsClusterTypeKubernetes),
+		ClusterId:           "demo-cluster-id",
+		VSphereUser:         "Administrator@vsphere.local",
+		ClusterFlavor:       string(cnstypes.CnsClusterFlavorVanilla),
+		ClusterDistribution: "OpenShift",
+	}
+
+	createVolume := func(name string) cnstypes.CnsVolumeId {
+		spec := cnstypes.CnsVolumeCreateSpec{
+			Name:       name,
+			VolumeType: string(cnstypes.CnsVolumeTypeBlock),
+			Datastores: []vim25types.ManagedObjectReference{ds.Reference()},
+			Metadata: cnstypes.CnsVolumeMetadata{
+				ContainerCluster: containerCluster,
+			},
+			BackingObjectDetails: &cnstypes.CnsBlockBackingDetails{
+				CnsBackingObjectDetails: cnstypes.CnsBackingObjectDetails{
+					CapacityInMb: 1024,
+				},
+			},
+		}
+		createTask, err := cnsClient.CreateVolume(ctx, []cnstypes.CnsVolumeCreateSpec{spec})
+		if err != nil {
+			t.Fatalf("CreateVolume(%s) failed: %v", name, err)
+		}
+		taskInfo, err := GetTaskInfo(ctx, createTask)
+		if err != nil {
+			t.Fatalf("GetTaskInfo CreateVolume(%s) failed: %v", name, err)
+		}
+		taskResult, err := GetTaskResult(ctx, taskInfo)
+		if err != nil {
+			t.Fatalf("GetTaskResult CreateVolume(%s) failed: %v", name, err)
+		}
+		opRes := taskResult.GetCnsVolumeOperationResult()
+		if opRes.Fault != nil {
+			t.Fatalf("CreateVolume(%s) fault: %+v", name, opRes.Fault)
+		}
+		return opRes.VolumeId
+	}
+
+	plainVolume := createVolume("pvc-" + uuid.New().String())
+	snapshottedVolume := createVolume("pvc-" + uuid.New().String())
+
+	var snapshotId cnstypes.CnsSnapshotId
+	t.Cleanup(func() {
+		cctx := context.Background()
+		if snapshotId.Id != "" {
+			delTask, err := cnsClient.DeleteSnapshots(cctx, []cnstypes.CnsSnapshotDeleteSpec{
+				{VolumeId: snapshottedVolume, SnapshotId: snapshotId},
+			})
+			if err == nil {
+				if info, err := GetTaskInfo(cctx, delTask); err == nil {
+					_, _ = GetTaskResult(cctx, info)
+				}
+			}
+		}
+		for _, vid := range []cnstypes.CnsVolumeId{plainVolume, snapshottedVolume} {
+			delTask, err := cnsClient.DeleteVolume(cctx, []cnstypes.CnsVolumeId{vid}, true)
+			if err != nil {
+				t.Logf("cleanup DeleteVolume(%s): %v", vid.Id, err)
+				continue
+			}
+			if info, err := GetTaskInfo(cctx, delTask); err == nil {
+				_, _ = GetTaskResult(cctx, info)
+			}
+		}
+	})
+
+	// Take an FCD snapshot on snapshottedVolume so it becomes a real
+	// unregister blocker (FcdSnapshotsPresent, Structural).
+	snapTask, err := cnsClient.CreateSnapshots(ctx, []cnstypes.CnsSnapshotCreateSpec{
+		{VolumeId: snapshottedVolume, Description: "unregister-feasibility-test"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSnapshots failed: %v", err)
+	}
+	snapTaskInfo, err := GetTaskInfo(ctx, snapTask)
+	if err != nil {
+		t.Fatalf("GetTaskInfo CreateSnapshots failed: %v", err)
+	}
+	snapResult, err := GetTaskResult(ctx, snapTaskInfo)
+	if err != nil {
+		t.Fatalf("GetTaskResult CreateSnapshots failed: %v", err)
+	}
+	if snapResult.GetCnsVolumeOperationResult().Fault != nil {
+		t.Fatalf("CreateSnapshots fault: %+v", snapResult.GetCnsVolumeOperationResult().Fault)
+	}
+	snapshotId = snapResult.(*cnstypes.CnsSnapshotCreateResult).Snapshot.SnapshotId
+	t.Logf("Created FCD snapshot %s on volume=%s", snapshotId.Id, snapshottedVolume.Id)
+
+	feasibilityTask, err := cnsClient.QueryUnregisterFeasibility(
+		ctx,
+		[]cnstypes.CnsVolumeId{plainVolume, snapshottedVolume},
+		string(cnstypes.CnsUnregisterTargetVolumeTypeLEGACY_DISK),
+	)
+	if err != nil {
+		t.Fatalf("QueryUnregisterFeasibility failed: %v", err)
+	}
+	feasibilityTaskInfo, err := GetTaskInfo(ctx, feasibilityTask)
+	if err != nil {
+		t.Fatalf("GetTaskInfo QueryUnregisterFeasibility failed: %v", err)
+	}
+	results, err := GetTaskResultArray(ctx, feasibilityTaskInfo)
+	if err != nil {
+		t.Fatalf("GetTaskResultArray QueryUnregisterFeasibility failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 feasibility results, got %d", len(results))
+	}
+
+	plainResult := results[0].(*cnstypes.CnsUnregisterFeasibilityResult)
+	if plainResult.Fault != nil {
+		t.Errorf("plain volume=%s: unexpected fault %+v", plainVolume.Id, plainResult.Fault)
+	}
+	if !plainResult.Feasible {
+		t.Errorf("plain volume=%s: expected feasible, blockers=%+v", plainVolume.Id, plainResult.Blockers)
+	}
+
+	snapshottedResult := results[1].(*cnstypes.CnsUnregisterFeasibilityResult)
+	if snapshottedResult.Feasible {
+		t.Errorf("snapshotted volume=%s: expected infeasible", snapshottedVolume.Id)
+	}
+	foundSnapshotBlocker := false
+	for _, b := range snapshottedResult.Blockers {
+		t.Logf("snapshotted volume=%s: blocker condition=%q disposition=%q detail=%q",
+			snapshottedVolume.Id, b.Condition, b.Disposition, b.Detail)
+		if b.Condition == cnstypes.CnsUnregisterBlockerConditionFcdSnapshotsPresent {
+			foundSnapshotBlocker = true
+			if b.Disposition != cnstypes.CnsUnregisterBlockerDispositionStructural {
+				t.Errorf("FcdSnapshotsPresent disposition: got %q, want %q",
+					b.Disposition, cnstypes.CnsUnregisterBlockerDispositionStructural)
+			}
+		}
+	}
+	if !foundSnapshotBlocker {
+		t.Errorf("snapshotted volume=%s: expected an FcdSnapshotsPresent blocker, got %+v",
+			snapshottedVolume.Id, snapshottedResult.Blockers)
 	}
 }
 

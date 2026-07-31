@@ -1124,8 +1124,10 @@ type CnsClearVolumeControlFlagsResponse struct {
 }
 
 // CnsUnregisterVolumeResult is the result of the CnsUnregisterVolumeEx operation.
-// It extends CnsVolumeOperationResult with the backing disk path and disk UUID
-// that must be persisted by the caller before invoking CnsAcknowledgeUnregister.
+// On success the volume is removed from the CNS inventory and BackingDiskPath/
+// DiskUUID identify the plain virtual disk left behind; the caller is
+// responsible for persisting them, since there is no further acknowledgement
+// round-trip.
 type CnsUnregisterVolumeResult struct {
 	CnsVolumeOperationResult
 
@@ -1156,37 +1158,89 @@ type CnsUnregisterVolumeExResponse struct {
 	Returnval types.ManagedObjectReference `xml:"returnval" json:"returnval"`
 }
 
-type CnsAcknowledgeUnregister CnsAcknowledgeUnregisterRequestType
+// CnsQueryUnregisterFeasibility evaluates, for each requested volume, whether
+// an in-place unregister (CnsUnregisterVolumeEx) would currently succeed. It
+// is side-effect free and safe to call on both attached and detached
+// volumes; a per-volume evaluation failure is reported on that volume's
+// result rather than failing the whole task.
+type CnsQueryUnregisterFeasibility CnsQueryUnregisterFeasibilityRequestType
 
 func init() {
-	types.Add("vsan:CnsAcknowledgeUnregister", reflect.TypeOf((*CnsAcknowledgeUnregister)(nil)).Elem())
+	types.Add("vsan:CnsQueryUnregisterFeasibility", reflect.TypeOf((*CnsQueryUnregisterFeasibility)(nil)).Elem())
 }
 
-type CnsAcknowledgeUnregisterRequestType struct {
-	This      types.ManagedObjectReference `xml:"_this" json:"-"`
-	VolumeIds []CnsVolumeId                `xml:"volumeIds,omitempty" json:"volumeIds,omitempty"`
-}
+// QueryUnregisterFeasibilityBatchLimit is the maximum number of volumes
+// accepted in a single CnsQueryUnregisterFeasibility request. It mirrors the
+// server-side limit; govmomi does not enforce it client-side, since the
+// server remains the source of truth.
+const QueryUnregisterFeasibilityBatchLimit = 128
 
-func init() {
-	types.Add("vsan:CnsAcknowledgeUnregisterRequestType", reflect.TypeOf((*CnsAcknowledgeUnregisterRequestType)(nil)).Elem())
-}
-
-type CnsAcknowledgeUnregisterResponse struct{}
-
-type CnsQueryPendingUnregisters CnsQueryPendingUnregistersRequestType
-
-func init() {
-	types.Add("vsan:CnsQueryPendingUnregisters", reflect.TypeOf((*CnsQueryPendingUnregisters)(nil)).Elem())
-}
-
-type CnsQueryPendingUnregistersRequestType struct {
-	This types.ManagedObjectReference `xml:"_this" json:"-"`
+type CnsQueryUnregisterFeasibilityRequestType struct {
+	This             types.ManagedObjectReference `xml:"_this" json:"-"`
+	VolumeIds        []CnsVolumeId                `xml:"volumeIds,omitempty" json:"volumeIds,omitempty"`
+	TargetVolumeType string                       `xml:"targetVolumeType" json:"targetVolumeType"`
 }
 
 func init() {
-	types.Add("vsan:CnsQueryPendingUnregistersRequestType", reflect.TypeOf((*CnsQueryPendingUnregistersRequestType)(nil)).Elem())
+	types.Add("vsan:CnsQueryUnregisterFeasibilityRequestType",
+		reflect.TypeOf((*CnsQueryUnregisterFeasibilityRequestType)(nil)).Elem())
 }
 
-type CnsQueryPendingUnregistersResponse struct {
-	Returnval []CnsUnregisterVolumeResult `xml:"returnval,omitempty" json:"returnval,omitempty"`
+type CnsQueryUnregisterFeasibilityResponse struct {
+	Returnval types.ManagedObjectReference `xml:"returnval" json:"returnval"`
+}
+
+// Known CnsUnregisterBlocker.Condition values. This is an open string enum:
+// a newer server may report a condition not in this list, and callers must
+// treat any unrecognized value as CnsUnregisterBlockerDispositionStructural.
+const (
+	CnsUnregisterBlockerConditionFcdSnapshotsPresent    = "FcdSnapshotsPresent"
+	CnsUnregisterBlockerConditionChangeTrackingEnabled  = "ChangeTrackingEnabled"
+	CnsUnregisterBlockerConditionLinkedClone            = "LinkedClone"
+	CnsUnregisterBlockerConditionMultiVmAttachment      = "MultiVmAttachment"
+	CnsUnregisterBlockerConditionHostUnreachable        = "HostUnreachable"
+	CnsUnregisterBlockerConditionDatastoreInaccessible  = "DatastoreInaccessible"
+	CnsUnregisterBlockerConditionHostVersionUnsupported = "HostVersionUnsupported"
+	CnsUnregisterBlockerConditionFeatureDisabled        = "FeatureDisabled"
+)
+
+// Known CnsUnregisterBlocker.Disposition values. Like Condition, this is an
+// open string enum, not a closed VMODL enum type. An unrecognized value must
+// be treated as CnsUnregisterBlockerDispositionStructural: deferring an
+// unfamiliar blocker is safe, retrying one forever is not.
+const (
+	CnsUnregisterBlockerDispositionPermanent  = "PERMANENT"
+	CnsUnregisterBlockerDispositionStructural = "STRUCTURAL"
+	CnsUnregisterBlockerDispositionTransient  = "TRANSIENT"
+)
+
+// CnsUnregisterBlocker is a single precondition currently blocking an
+// in-place unregister of a volume, as reported by
+// CnsQueryUnregisterFeasibility.
+type CnsUnregisterBlocker struct {
+	types.DynamicData
+
+	Condition   string `xml:"condition" json:"condition"`
+	Disposition string `xml:"disposition" json:"disposition"`
+	Detail      string `xml:"detail,omitempty" json:"detail,omitempty"`
+}
+
+func init() {
+	types.Add("CnsUnregisterBlocker", reflect.TypeOf((*CnsUnregisterBlocker)(nil)).Elem())
+}
+
+// CnsUnregisterFeasibilityResult is one entry of a CnsQueryUnregisterFeasibility
+// task result, in the same order as the requested VolumeIds. Feasible is true
+// iff Blockers is empty; a true result is a snapshot in time, not a guarantee,
+// so the subsequent unregister call must still handle failure.
+type CnsUnregisterFeasibilityResult struct {
+	CnsVolumeOperationResult
+
+	Feasible    bool                   `xml:"feasible" json:"feasible"`
+	Blockers    []CnsUnregisterBlocker `xml:"blockers,omitempty" json:"blockers,omitempty"`
+	EvaluatedAt time.Time              `xml:"evaluatedAt" json:"evaluatedAt"`
+}
+
+func init() {
+	types.Add("CnsUnregisterFeasibilityResult", reflect.TypeOf((*CnsUnregisterFeasibilityResult)(nil)).Elem())
 }
