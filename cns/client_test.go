@@ -16,11 +16,11 @@ import (
 	"github.com/dougm/pretty"
 	"github.com/google/uuid"
 
+	vimfault "github.com/vmware/govmomi/fault"
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/pbm"
 	"github.com/vmware/govmomi/property"
-	"github.com/vmware/govmomi/task"
 	"github.com/vmware/govmomi/vim25/debug"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/soap"
@@ -36,6 +36,20 @@ const VSphere80u3VersionInt = 803
 const VSphere91VersionInt = 910
 const VSphere912VersionInt = 912
 const VSphere92VersionInt = 920
+
+// enableSoapTraceIfRequested wires SOAP tracing into govmomi when CNS_DEBUG is
+// set to true, matching the convention TestClient uses. Traces are written to
+// the govmomi/cns/.soap directory, which is gitignored.
+func enableSoapTraceIfRequested() {
+	if os.Getenv("CNS_DEBUG") != "true" {
+		return
+	}
+	const soapTraceDirectory = ".soap"
+	if _, err := os.Stat(soapTraceDirectory); os.IsNotExist(err) {
+		os.Mkdir(soapTraceDirectory, 0755)
+	}
+	debug.SetProvider(&debug.FileProvider{Path: soapTraceDirectory})
+}
 
 func TestClient(t *testing.T) {
 	// set CNS_DEBUG to true if you need to emit soap traces from these tests
@@ -2035,6 +2049,9 @@ func TestUnregisterVolumeExFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	enableSoapTraceIfRequested()
+
 	c, err := govmomi.NewClient(ctx, u, true)
 	if err != nil {
 		t.Fatal(err)
@@ -2086,12 +2103,29 @@ func TestUnregisterVolumeExFlow(t *testing.T) {
 	// even though it is populated later in the test body.
 	var reregisteredIds []cnstypes.CnsVolumeId
 
+	// unregisteredPaths maps volume ID -> backing VMDK datastore path for
+	// volumes that have been unregistered from CNS but not yet re-registered.
+	// UnregisterVolumeEx drops the CNS and FCD objects but deliberately keeps
+	// the VMDK file, so DeleteVolume can no longer reach these volumes and
+	// cleanup has to delete the VMDK directly. Entries are removed once a
+	// volume is successfully re-registered in Step 3.
+	unregisteredPaths := make(map[string]string, numVolumes)
+
+	// vdm is used both to cross-check disk UUIDs in Step 2 and to delete
+	// orphaned VMDKs during cleanup.
+	vdm := object.NewVirtualDiskManager(cnsClient.vim25Client)
+
 	// cleanupVolume is a helper used by both the t.Cleanup block and the test
 	// body to delete a single CNS volume, treating NotFound as success (the
 	// volume is already gone, which is the desired state).
 	cleanupVolume := func(cctx context.Context, vid cnstypes.CnsVolumeId) {
 		delTask, err := cnsClient.DeleteVolume(cctx, []cnstypes.CnsVolumeId{vid}, true)
 		if err != nil {
+			// A volume the test body already deleted is reported as an immediate
+			// NotFound SOAP fault. That is the desired end state, not a problem.
+			if vimfault.Is(err, &vim25types.NotFound{}) {
+				return
+			}
 			t.Logf("cleanup DeleteVolume(%s): %v", vid.Id, err)
 			return
 		}
@@ -2116,20 +2150,48 @@ func TestUnregisterVolumeExFlow(t *testing.T) {
 		}
 	}
 
-	// Best-effort cleanup: delete any volumes that still exist (e.g. if the
-	// test fails mid-way). Covers both the original volumeIds and any
-	// reregisteredIds accumulated in Step 3.
+	// cleanupVMDK deletes a backing VMDK left behind by UnregisterVolumeEx.
+	// Used for volumes that were unregistered but never re-registered: those
+	// have no CNS or FCD object left for DeleteVolume to act on, so the file
+	// would otherwise leak on the datastore.
+	cleanupVMDK := func(cctx context.Context, volID, dsPath string) {
+		delTask, err := vdm.DeleteVirtualDisk(cctx, dsPath, dc)
+		if err != nil {
+			t.Logf("cleanup DeleteVirtualDisk(volume=%s, %s): %v", volID, dsPath, err)
+			return
+		}
+		if err := delTask.Wait(cctx); err != nil {
+			t.Logf("cleanup DeleteVirtualDisk(volume=%s, %s) wait: %v", volID, dsPath, err)
+			return
+		}
+		t.Logf("cleanup: deleted orphaned VMDK %s (volume=%s)", dsPath, volID)
+	}
+
+	// Best-effort cleanup for a test that fails part-way through. Each volume
+	// ends up in one of three states, and each needs a different teardown:
+	//   - re-registered (Step 3 done): a live CNS volume, delete via CNS.
+	//   - unregistered, never re-registered: only the VMDK survives, so delete
+	//     the file directly — DeleteVolume would report NotFound and leak it.
+	//   - never unregistered: a live CNS volume, delete via CNS.
 	t.Cleanup(func() {
 		cctx := context.Background()
 		// Collect all IDs to clean; de-duplicate in case FCD_TRANSACTION_SUPPORT
 		// returns the same ID for a re-registered volume.
 		seen := make(map[string]bool)
-		for _, vid := range append(reregisteredIds, volumeIds...) {
+		allIds := append(append([]cnstypes.CnsVolumeId{}, reregisteredIds...), volumeIds...)
+		for _, vid := range allIds {
 			if seen[vid.Id] {
 				continue
 			}
 			seen[vid.Id] = true
+			// Still unregistered: no CNS object to delete, handled as a VMDK below.
+			if _, orphaned := unregisteredPaths[vid.Id]; orphaned {
+				continue
+			}
 			cleanupVolume(cctx, vid)
+		}
+		for volID, dsPath := range unregisteredPaths {
+			cleanupVMDK(cctx, volID, dsPath)
 		}
 	})
 
@@ -2178,12 +2240,11 @@ func TestUnregisterVolumeExFlow(t *testing.T) {
 	// invocation carries exactly one spec.
 	// The BackingDiskPath and DiskUUID from each result are saved for use in
 	// step 3 (re-registration) and for cross-checking with VirtualDiskManager.
-	vdm := object.NewVirtualDiskManager(cnsClient.vim25Client)
 	for i, vid := range volumeIds {
 		unregSpec := []cnstypes.CnsUnregisterVolumeSpec{
 			{
 				VolumeId:         vid,
-				TargetVolumeType: string(cnstypes.CnsUnregisterTargetVolumeTypeFCD),
+				TargetVolumeType: string(cnstypes.CnsUnregisterTargetVolumeTypeLEGACY_DISK),
 			},
 		}
 		unregTask, err := cnsClient.UnregisterVolumeEx(ctx, unregSpec)
@@ -2210,6 +2271,9 @@ func TestUnregisterVolumeExFlow(t *testing.T) {
 			t.Fatalf("UnregisterVolumeEx[%d] volume=%s: BackingDiskPath is empty", i, vid.Id)
 		}
 		backingDiskPaths[i] = unregResult.BackingDiskPath
+		// The volume is now gone from CNS but its VMDK remains. Record it so
+		// cleanup deletes the file if the test never gets to re-register it.
+		unregisteredPaths[vid.Id] = unregResult.BackingDiskPath
 		t.Logf("UnregisterVolumeEx[%d] volume=%s backingDiskPath=%q diskUUID=%q",
 			i, vid.Id, unregResult.BackingDiskPath, unregResult.DiskUUID)
 
@@ -2235,31 +2299,36 @@ func TestUnregisterVolumeExFlow(t *testing.T) {
 
 	// Re-issuing UnregisterVolumeEx on an already-unregistered volume reports
 	// NotFound rather than success a second time; callers must treat that as
-	// success. Exercised once, against volumeIds[0], since the behavior is
+	// success. The server surfaces this one of two ways: as an immediate SOAP
+	// fault with no task created (what a 9.2 vCenter does today, since the
+	// volume ID cannot be resolved to build the task), or as a task that
+	// completes with a NotFound fault. Both are accepted — the contract that
+	// matters to callers is that the failure is NotFound and not something
+	// else. Exercised once, against volumeIds[0], since the behavior is
 	// per-volume and does not need repeating for all 10.
 	{
 		vid := volumeIds[0]
 		reUnregTask, err := cnsClient.UnregisterVolumeEx(ctx, []cnstypes.CnsUnregisterVolumeSpec{
 			{
 				VolumeId:         vid,
-				TargetVolumeType: string(cnstypes.CnsUnregisterTargetVolumeTypeFCD),
+				TargetVolumeType: string(cnstypes.CnsUnregisterTargetVolumeTypeLEGACY_DISK),
 			},
 		})
 		if err != nil {
-			t.Fatalf("second UnregisterVolumeEx volume=%s failed: %v", vid.Id, err)
+			if !vimfault.Is(err, &vim25types.NotFound{}) {
+				t.Fatalf("second UnregisterVolumeEx volume=%s: expected NotFound, got %v", vid.Id, err)
+			}
+			t.Logf("second UnregisterVolumeEx volume=%s: NotFound (immediate fault) as expected", vid.Id)
+		} else {
+			_, taskErr := GetTaskInfo(ctx, reUnregTask)
+			if taskErr == nil {
+				t.Fatalf("expected second UnregisterVolumeEx volume=%s to fault with NotFound, task succeeded", vid.Id)
+			}
+			if !vimfault.Is(taskErr, &vim25types.NotFound{}) {
+				t.Fatalf("expected NotFound fault on second UnregisterVolumeEx volume=%s, got %v", vid.Id, taskErr)
+			}
+			t.Logf("second UnregisterVolumeEx volume=%s: NotFound (task fault) as expected", vid.Id)
 		}
-		_, taskErr := GetTaskInfo(ctx, reUnregTask)
-		if taskErr == nil {
-			t.Fatalf("expected second UnregisterVolumeEx volume=%s to fault with NotFound, task succeeded", vid.Id)
-		}
-		terr, ok := taskErr.(task.Error)
-		if !ok {
-			t.Fatalf("expected task.Error, got %T: %v", taskErr, taskErr)
-		}
-		if _, ok := terr.Fault().(*vim25types.NotFound); !ok {
-			t.Fatalf("expected NotFound fault on second UnregisterVolumeEx volume=%s, got %T", vid.Id, terr.Fault())
-		}
-		t.Logf("second UnregisterVolumeEx volume=%s: NotFound as expected", vid.Id)
 	}
 
 	// Step 3: Re-register each volume as a static CNS volume using the VMDK URL
@@ -2334,6 +2403,9 @@ func TestUnregisterVolumeExFlow(t *testing.T) {
 		t.Logf("Re-registered volume[%d]: requested=%s got=%s sameID=%v",
 			i, vid.Id, reregOpRes.VolumeId.Id, sameID)
 		reregisteredIds = append(reregisteredIds, reregOpRes.VolumeId)
+		// The VMDK now belongs to a live CNS volume again, so cleanup should go
+		// through DeleteVolume rather than deleting the file behind CNS's back.
+		delete(unregisteredPaths, vid.Id)
 	}
 
 	// Step 3b: Wait for all re-registered volumes to become visible as CNS
@@ -2437,6 +2509,9 @@ func TestQueryUnregisterFeasibilityFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	enableSoapTraceIfRequested()
+
 	c, err := govmomi.NewClient(ctx, u, true)
 	if err != nil {
 		t.Fatal(err)
