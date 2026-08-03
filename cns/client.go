@@ -321,6 +321,50 @@ func (c *Client) SyncVolume(ctx context.Context, syncSpecs []cnstypes.CnsSyncVol
 	return object.NewTask(c.vim25Client, res.Returnval), nil
 }
 
+// UnregisterVolumeEx calls the CNS CnsUnregisterVolumeEx API, which unregisters
+// an in-place FCD (leaving the disk attached, if it was attached) and removes
+// the volume from CNS inventory in a single call. The task result is
+// CnsUnregisterVolumeResult, with BackingDiskPath and DiskUUID identifying the
+// plain virtual disk left behind. There is no acknowledgement round-trip:
+// durability of the returned identity is the caller's responsibility, and the
+// caller is expected to persist it before invoking this call. Because the
+// volume leaves CNS inventory on success, re-issuing this call on an
+// already-unregistered volume reports vim.fault.NotFound rather than success
+// a second time; callers must treat that NotFound as success.
+func (c *Client) UnregisterVolumeEx(ctx context.Context, spec []cnstypes.CnsUnregisterVolumeSpec) (*object.Task, error) {
+	req := cnstypes.CnsUnregisterVolumeEx{
+		This:           CnsVolumeManagerInstance,
+		UnregisterSpec: spec,
+	}
+	res, err := methods.CnsUnregisterVolumeEx(ctx, c, &req)
+	if err != nil {
+		return nil, err
+	}
+	return object.NewTask(c.vim25Client, res.Returnval), nil
+}
+
+// QueryUnregisterFeasibility calls the CNS CnsQueryUnregisterFeasibility API,
+// which evaluates, per volume and without side effects, whether
+// UnregisterVolumeEx would currently succeed. volumeIds must be non-empty and
+// at most QueryUnregisterFeasibilityBatchLimit; targetVolumeType is required
+// and only CnsUnregisterTargetVolumeTypeLEGACY_DISK is meaningful today. The
+// task result is a []CnsUnregisterFeasibilityResult, one per requested
+// volume, in request order; a volume that cannot be evaluated carries its own
+// Fault rather than failing the whole task.
+func (c *Client) QueryUnregisterFeasibility(
+	ctx context.Context, volumeIds []cnstypes.CnsVolumeId, targetVolumeType string) (*object.Task, error) {
+	req := cnstypes.CnsQueryUnregisterFeasibility{
+		This:             CnsVolumeManagerInstance,
+		VolumeIds:        volumeIds,
+		TargetVolumeType: targetVolumeType,
+	}
+	res, err := methods.CnsQueryUnregisterFeasibility(ctx, c, &req)
+	if err != nil {
+		return nil, err
+	}
+	return object.NewTask(c.vim25Client, res.Returnval), nil
+}
+
 // UnregisterVolume calls the CNS UnregisterVolume API
 func (c *Client) UnregisterVolume(ctx context.Context, spec []cnstypes.CnsUnregisterVolumeSpec) (*object.Task, error) {
 	req := cnstypes.CnsUnregisterVolume{

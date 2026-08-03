@@ -41,6 +41,7 @@ func New() *simulator.Registry {
 		volumes:                make(map[vim25types.ManagedObjectReference]map[cnstypes.CnsVolumeId]*cnstypes.CnsVolume),
 		attachments:            make(map[cnstypes.CnsVolumeId]vim25types.ManagedObjectReference),
 		snapshots:              make(map[cnstypes.CnsVolumeId]map[cnstypes.CnsSnapshotId]*cnstypes.CnsSnapshot),
+		unregisterBlockers:     make(map[cnstypes.CnsVolumeId][]cnstypes.CnsUnregisterBlocker),
 	})
 
 	return r
@@ -51,6 +52,24 @@ type CnsVolumeManager struct {
 	volumes     map[vim25types.ManagedObjectReference]map[cnstypes.CnsVolumeId]*cnstypes.CnsVolume
 	attachments map[cnstypes.CnsVolumeId]vim25types.ManagedObjectReference
 	snapshots   map[cnstypes.CnsVolumeId]map[cnstypes.CnsSnapshotId]*cnstypes.CnsSnapshot
+	// unregisterBlockers is test-injectable simulator-only state: it lets a
+	// test force CnsQueryUnregisterFeasibility to report specific blockers for
+	// a volume, since nothing about a simulated volume otherwise makes it
+	// infeasible to unregister. Not part of the real API.
+	unregisterBlockers map[cnstypes.CnsVolumeId][]cnstypes.CnsUnregisterBlocker
+}
+
+// SetUnregisterBlockers is test-only simulator surface: it forces
+// CnsQueryUnregisterFeasibility to report the given blockers for volumeId,
+// until cleared with SetUnregisterBlockers(volumeId, nil). This has no
+// counterpart in the real API, which derives blockers from actual FCD/host
+// state; the simulator has no such state to derive them from.
+func (m *CnsVolumeManager) SetUnregisterBlockers(volumeId cnstypes.CnsVolumeId, blockers []cnstypes.CnsUnregisterBlocker) {
+	if len(blockers) == 0 {
+		delete(m.unregisterBlockers, volumeId)
+		return
+	}
+	m.unregisterBlockers[volumeId] = blockers
 }
 
 const simulatorDiskUUID = "6000c298595bf4575739e9105b2c0c2d"
@@ -684,6 +703,129 @@ func (m *CnsVolumeManager) CnsDeleteSnapshots(ctx *simulator.Context, req *cnsty
 		Res: &cnstypes.CnsDeleteSnapshotsResponse{
 			Returnval: task.Run(ctx),
 		},
+	}
+}
+
+// CnsUnregisterVolumeEx simulates the single-phase in-place unregister: it
+// removes the volume from CNS inventory and returns the backing disk path and
+// disk UUID left behind. Only a single spec is supported, matching the real
+// API's restriction to at most one entry per call.
+func (m *CnsVolumeManager) CnsUnregisterVolumeEx(ctx *simulator.Context, req *cnstypes.CnsUnregisterVolumeEx) soap.HasFault {
+	task := simulator.CreateTask(m, "CnsUnregisterVolumeEx", func(*simulator.Task) (vim25types.AnyType, vim25types.BaseMethodFault) {
+		if len(req.UnregisterSpec) != 1 {
+			return nil, &vim25types.InvalidArgument{InvalidProperty: "unregisterSpec"}
+		}
+
+		spec := req.UnregisterSpec[0]
+		volumeId := spec.VolumeId
+
+		var backingDiskPath, diskUUID string
+		found := false
+
+		for ds, volumes := range m.volumes {
+			if vol, ok := volumes[volumeId]; ok {
+				found = true
+				if details, ok := vol.BackingObjectDetails.(*cnstypes.CnsBlockBackingDetails); ok {
+					backingDiskPath = details.BackingDiskPath
+					diskUUID = details.BackingDiskId
+				}
+				delete(m.volumes[ds], volumeId)
+				break
+			}
+		}
+
+		if !found {
+			// The volume is already gone, either because it was never
+			// created or because a prior call already unregistered it;
+			// callers must treat this the same way as any other delete
+			// NotFound: the desired state already holds.
+			return nil, &vim25types.NotFound{}
+		}
+
+		result := &cnstypes.CnsUnregisterVolumeResult{
+			CnsVolumeOperationResult: cnstypes.CnsVolumeOperationResult{
+				VolumeId: volumeId,
+			},
+			BackingDiskPath: backingDiskPath,
+			DiskUUID:        diskUUID,
+		}
+
+		return &cnstypes.CnsVolumeOperationBatchResult{
+			VolumeResults: []cnstypes.BaseCnsVolumeOperationResult{result},
+		}, nil
+	})
+
+	return &methods.CnsUnregisterVolumeExBody{
+		Res: &cnstypes.CnsUnregisterVolumeExResponse{
+			Returnval: task.Run(ctx),
+		},
+	}
+}
+
+// CnsQueryUnregisterFeasibility simulates the side-effect-free unregister
+// precondition check. Every known volume is reported feasible unless a test
+// has forced blockers onto it via SetUnregisterBlockers; an unknown volume
+// carries a per-entry fault rather than failing the whole task, matching the
+// real API's partial-failure-tolerant contract.
+func (m *CnsVolumeManager) CnsQueryUnregisterFeasibility(
+	ctx *simulator.Context, req *cnstypes.CnsQueryUnregisterFeasibility) soap.HasFault {
+	task := simulator.CreateTask(m, "CnsQueryUnregisterFeasibility",
+		func(*simulator.Task) (vim25types.AnyType, vim25types.BaseMethodFault) {
+			if len(req.VolumeIds) == 0 {
+				return nil, &vim25types.InvalidArgument{InvalidProperty: "volumeIds"}
+			}
+			if len(req.VolumeIds) > cnstypes.QueryUnregisterFeasibilityBatchLimit {
+				return nil, &vim25types.InvalidArgument{InvalidProperty: "volumeIds"}
+			}
+
+			results := make([]cnstypes.BaseCnsVolumeOperationResult, 0, len(req.VolumeIds))
+			for _, volumeId := range req.VolumeIds {
+				results = append(results, m.queryUnregisterFeasibilityOne(volumeId))
+			}
+
+			return &cnstypes.CnsVolumeOperationBatchResult{
+				VolumeResults: results,
+			}, nil
+		})
+
+	return &methods.CnsQueryUnregisterFeasibilityBody{
+		Res: &cnstypes.CnsQueryUnregisterFeasibilityResponse{
+			Returnval: task.Run(ctx),
+		},
+	}
+}
+
+// queryUnregisterFeasibilityOne evaluates a single volume for
+// CnsQueryUnregisterFeasibility. It returns a result carrying a fault, rather
+// than an error, for a volume that cannot be evaluated, since the task as a
+// whole must still succeed.
+func (m *CnsVolumeManager) queryUnregisterFeasibilityOne(volumeId cnstypes.CnsVolumeId) *cnstypes.CnsUnregisterFeasibilityResult {
+	found := false
+	for _, volumes := range m.volumes {
+		if _, ok := volumes[volumeId]; ok {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return &cnstypes.CnsUnregisterFeasibilityResult{
+			CnsVolumeOperationResult: cnstypes.CnsVolumeOperationResult{
+				VolumeId: volumeId,
+				Fault: &vim25types.LocalizedMethodFault{
+					Fault: &vim25types.NotFound{},
+				},
+			},
+		}
+	}
+
+	blockers := m.unregisterBlockers[volumeId]
+	return &cnstypes.CnsUnregisterFeasibilityResult{
+		CnsVolumeOperationResult: cnstypes.CnsVolumeOperationResult{
+			VolumeId: volumeId,
+		},
+		Feasible:    len(blockers) == 0,
+		Blockers:    blockers,
+		EvaluatedAt: time.Now(),
 	}
 }
 

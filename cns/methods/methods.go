@@ -435,3 +435,43 @@ func CnsClearVolumeControlFlags(ctx context.Context, r soap.RoundTripper, req *t
 
 	return resBody.Res, nil
 }
+
+type CnsUnregisterVolumeExBody struct {
+	Req    *types.CnsUnregisterVolumeEx         `xml:"urn:vsan CnsUnregisterVolumeEx,omitempty"`
+	Res    *types.CnsUnregisterVolumeExResponse `xml:"urn:vsan CnsUnregisterVolumeExResponse,omitempty"`
+	Fault_ *soap.Fault                          `xml:"http://schemas.xmlsoap.org/soap/envelope/ Fault,omitempty"`
+}
+
+func (b *CnsUnregisterVolumeExBody) Fault() *soap.Fault { return b.Fault_ }
+
+func CnsUnregisterVolumeEx(ctx context.Context, r soap.RoundTripper, req *types.CnsUnregisterVolumeEx) (*types.CnsUnregisterVolumeExResponse, error) {
+	var reqBody, resBody CnsUnregisterVolumeExBody
+
+	reqBody.Req = req
+
+	if err := r.RoundTrip(ctx, &reqBody, &resBody); err != nil {
+		return nil, err
+	}
+
+	return resBody.Res, nil
+}
+
+type CnsQueryUnregisterFeasibilityBody struct {
+	Req    *types.CnsQueryUnregisterFeasibility         `xml:"urn:vsan CnsQueryUnregisterFeasibility,omitempty"`
+	Res    *types.CnsQueryUnregisterFeasibilityResponse `xml:"urn:vsan CnsQueryUnregisterFeasibilityResponse,omitempty"`
+	Fault_ *soap.Fault                                  `xml:"http://schemas.xmlsoap.org/soap/envelope/ Fault,omitempty"`
+}
+
+func (b *CnsQueryUnregisterFeasibilityBody) Fault() *soap.Fault { return b.Fault_ }
+
+func CnsQueryUnregisterFeasibility(ctx context.Context, r soap.RoundTripper, req *types.CnsQueryUnregisterFeasibility) (*types.CnsQueryUnregisterFeasibilityResponse, error) {
+	var reqBody, resBody CnsQueryUnregisterFeasibilityBody
+
+	reqBody.Req = req
+
+	if err := r.RoundTrip(ctx, &reqBody, &resBody); err != nil {
+		return nil, err
+	}
+
+	return resBody.Res, nil
+}
